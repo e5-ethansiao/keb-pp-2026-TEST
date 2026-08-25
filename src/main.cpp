@@ -1,16 +1,51 @@
 #include <Arduino.h>
 
-// test_ultrasonic.cpp
+// ============================================================
+// SeatSense - Single Seat Demo (final state machine)
+// ============================================================
+// FREE (green)      -> button press                -> TAKEN (red)
+// TAKEN (red)       -> sensor stops detecting        -> FINISHING (yellow)
+// TAKEN (red)       -> sensor still detects           -> stays TAKEN (red)
+// FINISHING (yellow)-> 30s elapses OR button pressed -> FREE (green)
+// ============================================================
+
+// ---------- Pin map ----------
 #define TRIG_PIN 18
-#define ECHO_PIN 19 // input-only pin, via voltage divider
+#define ECHO_PIN 19       // via 1k/2.2k voltage divider
+#define BUTTON_PIN 4      // INPUT_PULLUP
 
-void setup() {
-  pinMode(TRIG_PIN, OUTPUT);
-  pinMode(ECHO_PIN, INPUT); // no INPUT_PULLUP - not supported on GPIO34/35/36/39... but 19 is a regular pin, fine either way
-  Serial.begin(115200);
-}
+#define LED_R 25
+#define LED_G 26
+#define LED_B 27
 
-void loop() {
+// Set true if the Jaycar RGB module is common ANODE (colors turn on with LOW).
+// Confirm this using your separate LED test file before flipping.
+#define COMMON_ANODE false
+
+// ---------- Tuning ----------
+const float OCCUPIED_THRESHOLD_CM = 80.0;         // closer than this = something detected
+const unsigned long PRESENCE_DEBOUNCE_MS = 1500;  // sensor reading must be stable this long
+const unsigned long FINISHING_TIMEOUT_MS = 15000; // yellow -> green after 15s
+const unsigned long BUTTON_DEBOUNCE_MS = 50;
+const unsigned long BUTTON_COOLDOWN_MS = 10000; // ignore further presses for 10s after one is accepted
+
+// ---------- State ----------
+enum SeatState { FREE, TAKEN, FINISHING };
+SeatState currentState = FREE;
+
+unsigned long lastPresenceChangeTime = 0;
+bool lastPresenceReading = false;
+bool stablePresence = false;
+
+unsigned long finishingStartTime = 0;
+
+bool lastButtonReading = HIGH;
+unsigned long lastButtonDebounceTime = 0;
+bool buttonActiveLast = false;
+unsigned long lastAcceptedPressTime = 0; // 0 = no press accepted yet
+
+// ---------- Ultrasonic ----------
+bool readPresence() {
   digitalWrite(TRIG_PIN, LOW);
   delayMicroseconds(2);
   digitalWrite(TRIG_PIN, HIGH);
@@ -18,14 +53,136 @@ void loop() {
   digitalWrite(TRIG_PIN, LOW);
 
   long duration = pulseIn(ECHO_PIN, HIGH, 30000); // 30ms timeout
-  float distanceCm = duration * 0.0343 / 2;
-
   if (duration == 0) {
-    Serial.println("No echo received (check wiring/divider)");
-  } else {
-    Serial.print("Distance: ");
-    Serial.print(distanceCm);
-    Serial.println(" cm");
+    return stablePresence; // no echo - hold last known reading
   }
-  delay(300);
+  float distanceCm = duration * 0.0343 / 2;
+  return distanceCm < OCCUPIED_THRESHOLD_CM;
+}
+
+void updateStablePresence() {
+  bool occupied = readPresence();
+  if (occupied != lastPresenceReading) {
+    lastPresenceReading = occupied;
+    lastPresenceChangeTime = millis();
+  }
+  if (millis() - lastPresenceChangeTime > PRESENCE_DEBOUNCE_MS) {
+    stablePresence = lastPresenceReading;
+  }
+}
+
+// ---------- Button (debounced, edge-triggered, cooldown-gated) ----------
+// Returns true at most once per physical press, and never again within
+// BUTTON_COOLDOWN_MS of the last accepted press.
+bool buttonPressedEdge() {
+  bool reading = digitalRead(BUTTON_PIN);
+  bool pressed = false;
+
+  if (reading != lastButtonReading) {
+    lastButtonDebounceTime = millis();
+  }
+
+  if (millis() - lastButtonDebounceTime > BUTTON_DEBOUNCE_MS) {
+    bool buttonActive = (reading == LOW); // pressed = LOW with INPUT_PULLUP
+    if (buttonActive && !buttonActiveLast) {
+      bool cooldownElapsed = (lastAcceptedPressTime == 0) ||
+                              (millis() - lastAcceptedPressTime > BUTTON_COOLDOWN_MS);
+      if (cooldownElapsed) {
+        pressed = true;
+        lastAcceptedPressTime = millis();
+      } else {
+        Serial.println("Button press ignored (cooldown active)");
+      }
+    }
+    buttonActiveLast = buttonActive;
+  }
+
+  lastButtonReading = reading;
+  return pressed;
+}
+
+// ---------- LED ----------
+void writeLED(int pin, bool on) {
+  if (COMMON_ANODE) {
+    digitalWrite(pin, on ? LOW : HIGH);
+  } else {
+    digitalWrite(pin, on ? HIGH : LOW);
+  }
+}
+
+void setLED(SeatState state) {
+  bool r = false, g = false, b = false;
+  switch (state) {
+    case FREE:      g = true; break;             // green
+    case TAKEN:     r = true; break;              // red
+    case FINISHING: r = true; g = true; break;    // yellow (red+green mix)
+  }
+  writeLED(LED_R, r);
+  writeLED(LED_G, g);
+  writeLED(LED_B, b);
+}
+
+const char* stateName(SeatState state) {
+  switch (state) {
+    case FREE: return "FREE";
+    case TAKEN: return "TAKEN";
+    case FINISHING: return "FINISHING";
+  }
+  return "UNKNOWN";
+}
+
+void changeState(SeatState newState) {
+  currentState = newState;
+  Serial.print("State change: ");
+  Serial.println(stateName(currentState));
+  setLED(currentState);
+}
+
+// ---------- State machine ----------
+void runStateMachine(bool pressed) {
+  switch (currentState) {
+    case FREE:
+      if (pressed) {
+        changeState(TAKEN);
+      }
+      break;
+
+    case TAKEN:
+      if (!stablePresence) {
+        changeState(FINISHING);
+        finishingStartTime = millis();
+      }
+      // while stablePresence is true, stays TAKEN (red) - no action needed
+      break;
+
+    case FINISHING:
+      if (stablePresence) {
+        changeState(TAKEN); // someone's back - cancel the finishing countdown
+      } else if (pressed || (millis() - finishingStartTime > FINISHING_TIMEOUT_MS)) {
+        changeState(FREE);
+      }
+      break;
+  }
+}
+
+void setup() {
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  pinMode(LED_R, OUTPUT);
+  pinMode(LED_G, OUTPUT);
+  pinMode(LED_B, OUTPUT);
+
+  Serial.begin(115200);
+  setLED(currentState);
+  Serial.println("SeatSense single-seat demo starting...");
+}
+
+void loop() {
+  updateStablePresence();
+  bool pressed = buttonPressedEdge();
+  runStateMachine(pressed);
+  setLED(currentState); // defensive: keep LED always in sync with current state
+  delay(50);
 }
